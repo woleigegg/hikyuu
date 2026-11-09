@@ -114,10 +114,10 @@ public:
         return 0;
     }
 
-    /** Get the held quantity of a security at the given moment */
+    /** Get the current predicted holding quantity; datetime is ignored. */
     virtual double getHoldNumber(const Datetime& datetime, const Stock& stock) override {
-        HKU_WARN("The subclass does not implement this method");
-        return 0.0;
+        auto iter = m_position.find(stock.id());
+        return iter != m_position.end() ? iter->second.number : 0.0;
     }
 
     /** Get the short held quantity of a security at the given moment */

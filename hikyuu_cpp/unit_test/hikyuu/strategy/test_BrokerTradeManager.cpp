@@ -309,4 +309,117 @@ TEST_CASE("test_BrokerTradeManager_checkin_checkout") {
     CHECK_EQ(tm.currentCash(), 30000.0);
 }
 
+TEST_CASE("test_BrokerTradeManager_snapshot_is_atomic") {
+    Stock stock = getStock("sh600000");
+    REQUIRE_UNARY(!stock.isNull());
+    auto initial = make_shared<AssetOrderBroker>(R"({
+        "datetime": "2000-01-04 10:00:00", "cash": 100000.0,
+        "positions": [{"market": "SH", "code": "600000", "number": 100.0,
+            "stoploss": 5.0, "goal_price": 0.0, "cost_price": 10.0}]
+    })");
+    BrokerTradeManager tm(initial);
+    tm.fetchAssetInfoFromBroker(initial);
+    REQUIRE_EQ(tm.getPosition(Null<Datetime>(), stock).number, 100.0);
+    const Datetime old_datetime = tm.lastDatetime();
+    const Datetime old_cutoff = tm.getBrokerLastDatetime();
+
+    /** @arg one malformed later row must not publish the new cash or any partial positions */
+    auto malformed = make_shared<AssetOrderBroker>(R"({
+        "datetime": "2000-01-05 10:00:00", "cash": 200000.0,
+        "positions": [
+            {"market": "SH", "code": "600000", "number": 200.0,
+             "stoploss": 5.0, "goal_price": 0.0, "cost_price": 10.0},
+            {"market": "SZ", "code": "000001", "number": "broken"}
+        ]
+    })");
+    tm.fetchAssetInfoFromBroker(malformed);
+    CHECK_EQ(tm.currentCash(), 100000.0);
+    CHECK_EQ(tm.getPosition(Null<Datetime>(), stock).number, 100.0);
+    CHECK_EQ(tm.lastDatetime(), old_datetime);
+    CHECK_EQ(tm.getBrokerLastDatetime(), old_cutoff);
+
+    /** @arg a later row missing cost_price must throw rather than assert on const JSON lookup */
+    auto missing_field = make_shared<AssetOrderBroker>(R"({
+        "datetime": "2000-01-05 10:00:00", "cash": 200000.0,
+        "positions": [
+            {"market": "SH", "code": "600000", "number": 200.0,
+             "stoploss": 5.0, "goal_price": 0.0, "cost_price": 10.0},
+            {"market": "SZ", "code": "000001", "number": 100.0,
+             "stoploss": 5.0, "goal_price": 0.0}
+        ]
+    })");
+    tm.fetchAssetInfoFromBroker(missing_field);
+    CHECK_EQ(tm.currentCash(), 100000.0);
+    CHECK_EQ(tm.getPosition(Null<Datetime>(), stock).number, 100.0);
+    CHECK_EQ(tm.lastDatetime(), old_datetime);
+    CHECK_EQ(tm.getBrokerLastDatetime(), old_cutoff);
+
+    /** @arg missing positions is not an explicit empty portfolio */
+    auto missing = make_shared<AssetOrderBroker>(R"({
+        "datetime": "2000-01-05 10:00:00", "cash": 200000.0
+    })");
+    tm.fetchAssetInfoFromBroker(missing);
+    CHECK_EQ(tm.currentCash(), 100000.0);
+    CHECK_EQ(tm.getPosition(Null<Datetime>(), stock).number, 100.0);
+    CHECK_EQ(tm.lastDatetime(), old_datetime);
+    CHECK_EQ(tm.getBrokerLastDatetime(), old_cutoff);
+
+    /** @arg invalid position containers, unknown/duplicate stocks and negative quantities fail */
+    const string position = R"({"market":"SH","code":"600000","number":100.0,
+        "stoploss":5.0,"goal_price":0.0,"cost_price":10.0})";
+    const string invalid_positions[] = {"null", "{}", "[" + position + "," + position + "]",
+                                        R"([{"market":"XX","code":"unknown","number":100.0,
+          "stoploss":5.0,"goal_price":0.0,"cost_price":10.0}])",
+                                        R"([{"market":"SH","code":"600000","number":-100.0,
+          "stoploss":5.0,"goal_price":0.0,"cost_price":10.0}])"};
+    for (const auto& positions : invalid_positions) {
+        CAPTURE(positions);
+        auto invalid = make_shared<AssetOrderBroker>(
+          R"({"datetime":"2000-01-05 10:00:00","cash":200000.0,"positions":)" + positions + "}");
+        tm.fetchAssetInfoFromBroker(invalid);
+        CHECK_EQ(tm.currentCash(), 100000.0);
+        CHECK_EQ(tm.getPosition(Null<Datetime>(), stock).number, 100.0);
+        CHECK_EQ(tm.lastDatetime(), old_datetime);
+        CHECK_EQ(tm.getBrokerLastDatetime(), old_cutoff);
+    }
+
+    /** @arg an explicit empty portfolio is a valid complete snapshot */
+    auto empty = make_shared<AssetOrderBroker>(R"({
+        "datetime": "2000-01-05 10:00:00", "cash": 200000.0, "positions": []
+    })");
+    tm.fetchAssetInfoFromBroker(empty);
+    CHECK_EQ(tm.currentCash(), 200000.0);
+    CHECK_EQ(tm.getStockNumber(), 0);
+    CHECK_EQ(tm.lastDatetime(), Datetime(200001051000));
+    CHECK_EQ(tm.getBrokerLastDatetime(), tm.lastDatetime());
+}
+
+TEST_CASE("test_BrokerTradeManager_getHoldNumber_matches_position") {
+    Stock stock = getStock("sh600000");
+    auto broker = make_shared<AssetOrderBroker>(R"({
+        "cash": 100000.0,
+        "positions": [{"market": "SH", "code": "600000", "number": 100.0,
+            "stoploss": 5.0, "goal_price": 0.0, "cost_price": 10.0}]
+    })");
+    BrokerTradeManager tm(broker);
+    tm.fetchAssetInfoFromBroker(broker);
+
+    /** @arg all position queries must refer to the same current account */
+    REQUIRE_UNARY(tm.have(stock));
+    CHECK_EQ(tm.getHoldNumber(Null<Datetime>(), stock), 100.0);
+    CHECK_EQ(tm.getHoldNumber(Null<Datetime>(), stock),
+             tm.getPosition(Null<Datetime>(), stock).number);
+    CHECK_EQ(tm.getPositionList().front().number, 100.0);
+    CHECK_EQ(tm.getHoldNumber(Null<Datetime>(), Stock()), 0.0);
+
+    /** @arg subsequent predicted trades and historical dates still query the current account */
+    const Datetime datetime = tm.lastDatetime();
+    REQUIRE_EQ(tm.buy(datetime, stock, 10.0, 100.0).business, BUSINESS_BUY);
+    CHECK_EQ(tm.getHoldNumber(datetime, stock), 200.0);
+    CHECK_EQ(tm.getHoldNumber(Datetime(199001010000), stock), 200.0);
+    REQUIRE_EQ(tm.sell(datetime, stock, 10.0, 200.0).business, BUSINESS_SELL);
+    CHECK_EQ(tm.getHoldNumber(datetime, stock), 0.0);
+    CHECK_UNARY(!tm.have(stock));
+}
+
 /** @} */  // end of test_BrokerTradeManager

@@ -67,43 +67,45 @@ void BrokerTradeManager::fetchAssetInfoFromBroker(const OrderBrokerPtr& broker,
     }
 
     try {
-        json asset = json::parse(brk_asset);
-        Datetime new_datetime =
-          asset.contains("datetime") ? Datetime(asset["datetime"].get<string>()) : Datetime::now();
+        const json asset = json::parse(brk_asset);
+        HKU_CHECK(asset.is_object(), "The broker asset snapshot must be an object");
+        Datetime new_datetime = asset.contains("datetime")
+                                  ? Datetime(asset.at("datetime").get<string>())
+                                  : Datetime::now();
         if (firstDatetime().isNull() && !datetime.isNull()) {
             new_datetime = datetime;
         }
-        price_t new_cash = asset["cash"].get<price_t>();
+        price_t new_cash = asset.at("cash").get<price_t>();
+        HKU_CHECK(std::isfinite(new_cash), "Invalid broker cash: {}", new_cash);
 
         int precision = getParam<int>("precision");
         position_map_type new_position;
-        auto& positions = asset["positions"];
+        const auto& positions = asset.at("positions");
+        HKU_CHECK(positions.is_array(), "The broker positions must be an array");
         for (auto iter = positions.cbegin(); iter != positions.cend(); ++iter) {
-            try {
-                const auto& jpos = *iter;
-                auto market = jpos["market"].get<string>();
-                auto code = jpos["code"].get<string>();
-                Stock stock = getStock(fmt::format("{}{}", market, code));
-                if (stock.isNull()) {
-                    HKU_DEBUG("Not found stock: {}{}", market, code);
-                    continue;
-                }
+            const auto& jpos = *iter;
+            auto market = jpos.at("market").get<string>();
+            auto code = jpos.at("code").get<string>();
+            Stock stock = getStock(fmt::format("{}{}", market, code));
+            HKU_CHECK(!stock.isNull(), "Not found stock: {}{}", market, code);
 
-                PositionRecord pos;
-                pos.stock = stock;
-                pos.takeDatetime = new_datetime;
-                pos.number = jpos["number"].get<double>();
-                pos.stoploss = jpos["stoploss"].get<price_t>();
-                pos.goalPrice = jpos["goal_price"].get<price_t>();
-                pos.totalNumber = pos.number;
-                price_t cost_price = jpos["cost_price"].get<price_t>();
-                pos.buyMoney = roundEx(pos.number * cost_price * stock.unit(), precision);
-                pos.totalRisk =
-                  roundEx((cost_price - pos.stoploss) * pos.number * stock.unit(), precision);
-                new_position[stock.id()] = pos;
-            } catch (const std::exception& e) {
-                HKU_ERROR(e.what());
-            }
+            PositionRecord pos;
+            pos.stock = stock;
+            pos.takeDatetime = new_datetime;
+            pos.number = jpos.at("number").get<double>();
+            pos.stoploss = jpos.at("stoploss").get<price_t>();
+            pos.goalPrice = jpos.at("goal_price").get<price_t>();
+            pos.totalNumber = pos.number;
+            price_t cost_price = jpos.at("cost_price").get<price_t>();
+            HKU_CHECK(std::isfinite(pos.number) && pos.number >= 0.0 &&
+                        std::isfinite(pos.stoploss) && std::isfinite(pos.goalPrice) &&
+                        std::isfinite(cost_price),
+                      "Invalid broker position: {}{}", market, code);
+            pos.buyMoney = roundEx(pos.number * cost_price * stock.unit(), precision);
+            pos.totalRisk =
+              roundEx((cost_price - pos.stoploss) * pos.number * stock.unit(), precision);
+            HKU_CHECK(new_position.emplace(stock.id(), pos).second,
+                      "Duplicate broker position: {}{}", market, code);
         }
 
         m_datetime = new_datetime;
@@ -134,18 +136,18 @@ PositionRecord BrokerTradeManager::getPosition(const Datetime& date, const Stock
 }
 
 bool BrokerTradeManager::checkin(const Datetime& datetime, price_t cash) {
-    HKU_WARN_IF_RETURN(!std::isfinite(cash) || cash <= 0.0, false,
-                       "{} Invalid checkin cash({})!", datetime, cash);
+    HKU_WARN_IF_RETURN(!std::isfinite(cash) || cash <= 0.0, false, "{} Invalid checkin cash({})!",
+                       datetime, cash);
     m_cash += cash;
     return true;
 }
 
 bool BrokerTradeManager::checkout(const Datetime& datetime, price_t cash) {
-    HKU_WARN_IF_RETURN(!std::isfinite(cash) || cash <= 0.0, false,
-                       "{} Invalid checkout cash({})!", datetime, cash);
+    HKU_WARN_IF_RETURN(!std::isfinite(cash) || cash <= 0.0, false, "{} Invalid checkout cash({})!",
+                       datetime, cash);
     if (cash > m_cash) {
-        HKU_WARN("{} {} checkout cash({}) exceeds the current cash({}), clamped!",
-                 datetime, name(), cash, m_cash);
+        HKU_WARN("{} {} checkout cash({}) exceeds the current cash({}), clamped!", datetime, name(),
+                 cash, m_cash);
         m_cash = 0.0;
     } else {
         m_cash -= cash;
@@ -277,8 +279,8 @@ TradeRecord BrokerTradeManager::sell(const Datetime& datetime, const Stock& stoc
     if (acc_price == 0.0) {
         acc_price = getLatestClosePrice(stock);
         HKU_WARN_IF_RETURN(acc_price <= 0.0, result,
-                           "{} {} No available reference price for the market order sell!", datetime,
-                           stock.market_code());
+                           "{} {} No available reference price for the market order sell!",
+                           datetime, stock.market_code());
     }
 
     CostRecord cost = getSellCost(datetime, stock, acc_price, real_number);
